@@ -5,17 +5,12 @@ import json
 import logging
 import uuid
 from typing import Any
-
+import time 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from langchain_groq import ChatGroq
-from langchain_core.messages import (
-    SystemMessage,
-    HumanMessage,
-    AIMessage,
-    ToolMessage,
-)
+import asyncio
+import litellm
 from pi_bench.env import load_env
 
 logger = logging.getLogger(__name__)
@@ -113,68 +108,9 @@ def get_windowed_messages(context_id) -> list:
         return [first] + window
     return window
 
-def _format_tool_calls(tool_calls: list) -> list:
-    result = []
-    for tc in tool_calls:
-        fn = tc.get("function", {})
-        args = fn.get("arguments", "{}")
-        result.append({
-            "id": tc.get("id", str(uuid.uuid4())),
-            "name": fn.get("name", ""),
-            "args": json.loads(args) if isinstance(args, str) else args,
-            "type": "tool_call",
-        })
-    return result
-
-def _to_langchain_message(messages: list[dict]):
-    lc_messages = []
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content") or ""
-
-        if role == 'user':
-            lc_messages.append(HumanMessage(content=content))
-
-        elif role == 'assistant':
-            tool_calls = msg.get("tool_calls") or []
-            if tool_calls:
-                lc_messages.append(AIMessage(content=content, tool_calls=_format_tool_calls(tool_calls)))
-            else:
-                lc_messages.append(AIMessage(content=content))
-
-
-        elif role == "tool":
-            lc_messages.append(ToolMessage(content=content,tool_call_id=msg.get("tool_call_id"),))
-
-    return lc_messages
-
-def _format_response(response) -> dict:
-    tool_calls = getattr(response, "tool_calls", None)
-    content = response.content or ""
-
-    if tool_calls:
-        tc_list = []
-        for tc in tool_calls:
-            tc_list.append({
-                "id": tc.get("id"),
-                "type": "function",
-                "function": {
-                    "name": tc.get("name"),
-                    "arguments": json.dumps(tc.get("args")),
-                },
-            })
-        return {"kind": "data", "data": {"tool_calls": tc_list, "content": content}}
-
-    if content:
-        return {"kind": "data", "data": {"content": content}}
-
-    return {"kind": "data", "data": {"content": "###STOP###"}}
 
 def _build_system_prompt(benchmark_context: list[dict], tools: list[dict]) -> str:
-    # starts with OUR ReAct prompt
     sections = [_DEFAULT_SYSTEM_PROMPT, "\n## Benchmark Context"]
-    
-    # then appends policy.md content from benchmark_context
     for node in benchmark_context or []:
         kind = str(node.get("kind", "context")).strip() or "context"
         content = str(node.get("content", "")).strip()
@@ -182,8 +118,6 @@ def _build_system_prompt(benchmark_context: list[dict], tools: list[dict]) -> st
             continue
         title = kind.replace("_", " ").title()
         sections.append(f"\n### {title}\n{content}")
-
-    # then appends tool list
     if tools:
         sections.append("\n## Available Tools")
         for tool in tools:
@@ -195,27 +129,75 @@ def _build_system_prompt(benchmark_context: list[dict], tools: list[dict]) -> st
         sections.append(
             "\nDecision values for record_decision: ALLOW, ALLOW-CONDITIONAL, DENY, ESCALATE."
         )
-
     return "\n".join(sections).strip()
 
 
-async def _run_langchain(context_id: str) -> dict:
+async def _run_agent(context_id: str) -> dict:
     session = get_session(context_id)
-    
-    
     windowed = get_windowed_messages(context_id)
-    lc_messages = [SystemMessage(content=session['system_prompt'])] + _to_langchain_message(windowed)
-    
-    # 2. Set up LLM
-    llm = ChatGroq(model=_model, temperature=0.0)
+    model_messages = [
+        {"role": "system", "content": session["system_prompt"]}
+    ] + windowed
+    kwargs = {
+        "model": _model,
+        "messages": model_messages,
+        "drop_params": True,
+         
+    }
     if session["tools"]:
-        llm = llm.bind_tools(session['tools'])
-    
-    # 3. Call LLM
-    response = llm.invoke(lc_messages)
-    
-    # 4. Return response
-    return _format_response(response)
+        kwargs["tools"] = session["tools"]
+    if _seed is not None:
+        kwargs["seed"] = _seed
+
+    for attempt in range(3):
+        try:
+            response = await asyncio.to_thread(litellm.completion, **kwargs)
+            return _format_response(response.choices[0].message)
+        except litellm.exceptions.RateLimitError:
+            wait = 65 * (attempt + 1)
+            logger.warning("Rate limited, waiting %ds...", wait)
+            await asyncio.sleep(wait)
+
+    raise Exception("Rate limit exceeded after 3 retries")
+
+
+def _format_response(message: Any) -> dict:
+    tool_calls_raw = getattr(message, "tool_calls", None)
+    content = getattr(message, "content", None)
+    if tool_calls_raw:
+        tc_list = []
+        for tc in tool_calls_raw:
+            tc_list.append({
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            })
+        data: dict[str, Any] = {"tool_calls": tc_list}
+        if content:
+            data["content"] = content
+        return {"kind": "data", "data": data}
+    if content:
+        return {"kind": "data", "data": {"content": content}}
+    return {"kind": "data", "data": {"content": "###STOP###"}}
+
+
+def _jsonrpc_success(request_id: str | None, part: dict) -> JSONResponse:
+    return JSONResponse({
+        "jsonrpc": "2.0",
+        "id": request_id or str(uuid.uuid4()),
+        "result": {"status": {"message": {"role": "agent", "parts": [part]}}},
+    })
+
+
+def _jsonrpc_error(request_id: str | None, code: int, message: str) -> JSONResponse:
+    return JSONResponse({
+        "jsonrpc": "2.0",
+        "id": request_id or str(uuid.uuid4()),
+        "error": {"code": code, "message": message},
+    })
 
 
 @app.get("/.well-known/agent.json")
@@ -227,3 +209,79 @@ async def agent_card() -> JSONResponse:
         "extensions": [POLICY_BOOTSTRAP_EXTENSION],
         "capabilities": {"message": True},
     })
+
+@app.get("/.well-known/agent-card.json")
+async def agent_card_alias() -> JSONResponse:
+    return await agent_card()
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    return JSONResponse({"status": "ok", "model": _model})
+
+
+@app.post("/")
+async def message_send(request: Request) -> JSONResponse:
+    body = await request.json()
+    method = body.get("method", "")
+    if method != "message/send":
+        return _jsonrpc_error(body.get("id"), -32601, f"Unknown method: {method}")
+    params = body.get("params", {})
+    message = params.get("message", {})
+    parts = message.get("parts", [])
+    if not parts:
+        return _jsonrpc_error(body.get("id"), -32602, "No message parts")
+    data = parts[0].get("data", {})
+    if data.get("bootstrap"):
+        return _handle_bootstrap(body.get("id"), data)
+    return await _handle_turn(body.get("id"), data)
+
+
+def _handle_bootstrap(request_id, data) -> JSONResponse:
+    context_id = str(uuid.uuid4())
+    benchmark_context = data.get("benchmark_context") or []
+    tools = data.get("tools") or []
+    system_prompt = _build_system_prompt(benchmark_context, tools)
+    create_session(context_id, system_prompt, tools)
+    logger.info("Bootstrap: context_id=%s tools=%d", context_id, len(tools))
+    return _jsonrpc_success(request_id, {
+        "kind": "data",
+        "data": {"bootstrapped": True, "context_id": context_id},
+    })
+
+
+async def _handle_turn(request_id, data) -> JSONResponse:
+    context_id = data.get("context_id")
+    messages = data.get("messages") or []
+    if not context_id or get_session(context_id) is None:
+        return _jsonrpc_error(request_id, -32004, f"Unknown context_id: {context_id}")
+    for msg in messages:
+        add_message(context_id, msg)
+    try:
+        result_part = await _run_agent(context_id)
+        return _jsonrpc_success(request_id, result_part)
+    except Exception as exc:
+        logger.exception("Agent failed")
+        return _jsonrpc_error(request_id, -32000, str(exc))
+
+
+def main() -> None:
+    global _model, _seed, _card_url
+    load_env()
+    parser = argparse.ArgumentParser(description="pi-bench purple agent v2")
+    parser.add_argument("--model", type=str, default="groq/llama-3.3-70b-versatile")
+    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--card-url", type=str, default="")
+    parser.add_argument("--seed", type=int, default=None)
+    args = parser.parse_args()
+    _model = args.model
+    _seed = args.seed
+    _card_url = args.card_url
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    logger.info("Starting purple agent v2: model=%s port=%d", _model, args.port)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()
