@@ -37,3 +37,8 @@ packages = ["src/pi_bench", "domains"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-p no:capture -p no:rerunfailures"
+
+[dependency-groups]
+dev = [
+    "ipykernel (>=7.2.0,<8.0.0)"
+]
